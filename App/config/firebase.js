@@ -1,9 +1,9 @@
 // config/firebase.js
 import { initializeApp } from "firebase/app";
-import { initializeAuth, getReactNativePersistence } from "firebase/auth";
+import { initializeAuth, getReactNativePersistence, browserLocalPersistence } from "firebase/auth";
 import { getFirestore } from "firebase/firestore";
 import { getStorage } from "firebase/storage";
-import ReactNativeAsyncStorage from '@react-native-async-storage/async-storage';
+import { Platform } from "react-native";
 
 // Firebase configuration (from environment variables)
 
@@ -20,10 +20,19 @@ const firebaseConfig = {
 // 1. Initialize App
 export const app = initializeApp(firebaseConfig);
 
-// 2. Initialize Auth (With Memory Fix)
-export const auth = initializeAuth(app, {
-  persistence: getReactNativePersistence(ReactNativeAsyncStorage)
-});
+// 2. Initialize Auth (platform-aware persistence)
+let auth;
+if (Platform.OS === "web") {
+  auth = initializeAuth(app, {
+    persistence: browserLocalPersistence,
+  });
+} else {
+  const ReactNativeAsyncStorage = require("@react-native-async-storage/async-storage").default;
+  auth = initializeAuth(app, {
+    persistence: getReactNativePersistence(ReactNativeAsyncStorage),
+  });
+}
+export { auth };
 
 // 3. Exports
 export const firestore = getFirestore(app);

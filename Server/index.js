@@ -16,8 +16,6 @@ app.use(express.json());
 
 app.use("/api", faceApiRoutes);
 
-app.use("/api", faceApiRoutes);
-
 // Start the Server
 app.listen(PORT, '0.0.0.0', async () => {
     console.log(`Server is running on port ${PORT}`);

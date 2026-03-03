@@ -2,7 +2,7 @@ import React, { useState } from "react";
 import { notifyStudentRegistered } from './NotificationHelper';
 import {
   View, Text, TextInput, TouchableOpacity, Alert,
-  ActivityIndicator, ScrollView, StyleSheet, Platform, KeyboardAvoidingView
+  ActivityIndicator, ScrollView, StyleSheet, Platform, KeyboardAvoidingView, Image
 } from "react-native";
 import * as ImagePicker from "expo-image-picker";
 import { Ionicons } from '@expo/vector-icons';
@@ -11,31 +11,43 @@ import useApiUrl from '../../hooks/useApiUrl';
 
 import { sendAdminNotification } from '../../services/notificationService';
 
+const MAX_PHOTOS = 3;
+
 export default function RegisterScreen({ navigation }) {
   const { apiUrl: BACKEND_API_URL, loadingUrl } = useApiUrl();
   // --- STATE ---
   const [name, setName] = useState("");
   const [indexNumber, setIndexNumber] = useState("");
-  const [grade, setGrade] = useState(""); // Added Grade
-  const [section, setSection] = useState(""); // Added Section
+  const [grade, setGrade] = useState("");
+  const [section, setSection] = useState("");
   const [guardianName, setGuardianName] = useState("");
   const [contactNumber, setContactNumber] = useState("");
   const [address, setAddress] = useState("");
 
-  const [image, setImage] = useState(null);
+  const [images, setImages] = useState([]); // Array of URIs (max 3)
   const [loading, setLoading] = useState(false);
 
-  // --- 1. CAMERA FUNCTION ---
+  // --- 1. CAMERA FUNCTION (Multi-Photo) ---
   const pickImage = async () => {
+    if (images.length >= MAX_PHOTOS) {
+      Alert.alert("Maximum Reached", `You can only capture up to ${MAX_PHOTOS} photos.`);
+      return;
+    }
+
     try {
       const result = await ImagePicker.launchCameraAsync({
         quality: 0.5,
-        // No editing/cropping to avoid crashes on some devices
       });
 
       if (!result.canceled) {
-        setImage(result.assets[0].uri);
-        Alert.alert("✅ Photo Captured", "Face data is ready.");
+        const uri = result.assets[0].uri;
+        setImages(prev => [...prev, uri]);
+        const remaining = MAX_PHOTOS - images.length - 1;
+        if (remaining > 0) {
+          Alert.alert("✅ Photo Captured", `${images.length + 1}/${MAX_PHOTOS} photos taken. You can add ${remaining} more for better accuracy.`);
+        } else {
+          Alert.alert("✅ All Photos Captured", `${MAX_PHOTOS}/${MAX_PHOTOS} photos taken. Ready to register!`);
+        }
       }
     } catch (error) {
       console.log("Camera Error:", error);
@@ -43,16 +55,19 @@ export default function RegisterScreen({ navigation }) {
     }
   };
 
-  // --- 2. REGISTER FUNCTION (Now Checks ALL Fields) ---
+  const removeImage = (index) => {
+    setImages(prev => prev.filter((_, i) => i !== index));
+  };
+
+  // --- 2. REGISTER FUNCTION ---
   const handleRegister = async () => {
     if (loadingUrl) {
       Alert.alert("Connecting", "Please wait while connecting to the server...");
       return;
     }
 
-    // 🚨 VALIDATION CHECK: All text fields are now REQUIRED
-    if (!name || !indexNumber || !grade || !section || !guardianName || !contactNumber || !address || !image) {
-      return Alert.alert("Missing Data", "All fields (Name, Index, Grade, Section, Guardian, Contact, Address) are required.");
+    if (!name || !indexNumber || !grade || !section || !guardianName || !contactNumber || !address || images.length === 0) {
+      return Alert.alert("Missing Data", "All fields and at least 1 face photo are required.");
     }
 
     setLoading(true);
@@ -66,17 +81,26 @@ export default function RegisterScreen({ navigation }) {
       formData.append("contactNumber", contactNumber);
       formData.append("homeAddress", address);
 
-      // Image remains OPTIONAL (only appended if taken)
-      if (image) {
-        const filename = image.split('/').pop();
+      // Append ALL captured images
+      for (let index = 0; index < images.length; index++) {
+        const uri = images[index];
+        const filename = uri.split('/').pop();
         const match = /\.(\w+)$/.exec(filename);
         const type = match ? `image/${match[1]}` : `image/jpeg`;
+        const name = `face_${index}.${match ? match[1] : 'jpg'}`;
 
-        formData.append("faceImage", {
-          uri: Platform.OS === "android" ? image : image.replace("file://", ""),
-          name: filename,
-          type: type
-        });
+        if (Platform.OS === "web") {
+          // On web, convert URI to a Blob
+          const response = await fetch(uri);
+          const blob = await response.blob();
+          formData.append("faceImages", blob, name);
+        } else {
+          formData.append("faceImages", {
+            uri: Platform.OS === "android" ? uri : uri.replace("file://", ""),
+            name: name,
+            type: type
+          });
+        }
       }
 
       console.log("Sending data to:", `${BACKEND_API_URL}/enroll-student`);
@@ -85,7 +109,6 @@ export default function RegisterScreen({ navigation }) {
         headers: { "Content-Type": "multipart/form-data" },
       });
 
-      // 🔔 Add Firestore notification
       await notifyStudentRegistered(name);
 
       await sendAdminNotification(
@@ -93,7 +116,7 @@ export default function RegisterScreen({ navigation }) {
         'success'
       );
 
-      Alert.alert("Success", "Student Registered Successfully!", [
+      Alert.alert("Success", `Student registered with ${images.length} face photo(s)!`, [
         { text: "OK", onPress: () => navigation.goBack() }
       ]);
 
@@ -105,7 +128,7 @@ export default function RegisterScreen({ navigation }) {
       setGuardianName("");
       setContactNumber("");
       setAddress("");
-      setImage(null);
+      setImages([]);
 
     } catch (err) {
       console.error(err);
@@ -212,20 +235,57 @@ export default function RegisterScreen({ navigation }) {
             />
           </View>
 
-          {/* Section: Biometric Data */}
-          <Text style={styles.sectionHeader}>Scan Face</Text>
+          {/* Section: Multi-Photo Face Capture */}
+          <Text style={styles.sectionHeader}>Scan Face ({images.length}/{MAX_PHOTOS} Photos)</Text>
 
-          <TouchableOpacity onPress={pickImage} style={[styles.cameraBox, image && styles.cameraBoxSuccess]}>
-            {image ? (
+          {/* Thumbnail Previews */}
+          {images.length > 0 && (
+            <View style={styles.thumbnailRow}>
+              {images.map((uri, index) => (
+                <View key={index} style={styles.thumbnailContainer}>
+                  <Image source={{ uri }} style={styles.thumbnail} />
+                  <TouchableOpacity
+                    style={styles.removeButton}
+                    onPress={() => removeImage(index)}
+                  >
+                    <Ionicons name="close-circle" size={22} color="#F44336" />
+                  </TouchableOpacity>
+                  <Text style={styles.thumbnailLabel}>Photo {index + 1}</Text>
+                </View>
+              ))}
+            </View>
+          )}
+
+          {/* Camera Capture Button */}
+          <TouchableOpacity
+            onPress={pickImage}
+            style={[
+              styles.cameraBox,
+              images.length > 0 && images.length < MAX_PHOTOS && styles.cameraBoxPartial,
+              images.length >= MAX_PHOTOS && styles.cameraBoxSuccess,
+            ]}
+            disabled={images.length >= MAX_PHOTOS}
+          >
+            {images.length >= MAX_PHOTOS ? (
               <View style={{ alignItems: 'center' }}>
                 <Ionicons name="checkmark-circle" size={50} color="#27ae60" />
-                <Text style={[styles.cameraText, { color: "#27ae60" }]}>Photo Captured</Text>
-                <Text style={{ color: "#666", fontSize: 12, marginTop: 5 }}>(Tap to Retake)</Text>
+                <Text style={[styles.cameraText, { color: "#27ae60" }]}>All Photos Captured</Text>
+              </View>
+            ) : images.length > 0 ? (
+              <View style={{ alignItems: 'center' }}>
+                <Ionicons name="camera-outline" size={40} color="#007AFF" />
+                <Text style={styles.cameraText}>Add Another Angle ({images.length}/{MAX_PHOTOS})</Text>
+                <Text style={{ color: "#666", fontSize: 12, marginTop: 4 }}>
+                  More photos = better accuracy
+                </Text>
               </View>
             ) : (
               <View style={{ alignItems: 'center' }}>
                 <Ionicons name="scan-outline" size={40} color="#007AFF" />
                 <Text style={styles.cameraText}>Scan Face</Text>
+                <Text style={{ color: "#666", fontSize: 12, marginTop: 4 }}>
+                  Take up to {MAX_PHOTOS} photos for best results
+                </Text>
               </View>
             )}
           </TouchableOpacity>
@@ -274,11 +334,44 @@ const styles = StyleSheet.create({
     width: "100%", backgroundColor: "#1E1E1E", color: "#fff",
     padding: 15, borderRadius: 10, borderWidth: 1, borderColor: "#333", fontSize: 16
   },
+  thumbnailRow: {
+    flexDirection: 'row',
+    width: '100%',
+    marginBottom: 12,
+    gap: 10,
+  },
+  thumbnailContainer: {
+    alignItems: 'center',
+    position: 'relative',
+  },
+  thumbnail: {
+    width: 80,
+    height: 80,
+    borderRadius: 10,
+    borderWidth: 2,
+    borderColor: '#27ae60',
+  },
+  removeButton: {
+    position: 'absolute',
+    top: -8,
+    right: -8,
+    backgroundColor: '#0D0D0D',
+    borderRadius: 11,
+  },
+  thumbnailLabel: {
+    color: '#999',
+    fontSize: 11,
+    marginTop: 4,
+  },
   cameraBox: {
     width: "100%", height: 120, backgroundColor: "#1E1E1E",
     justifyContent: "center", alignItems: "center", marginBottom: 20,
     borderRadius: 10,
     borderStyle: 'dashed', borderWidth: 2, borderColor: '#007AFF'
+  },
+  cameraBoxPartial: {
+    borderColor: '#FFA500',
+    backgroundColor: 'rgba(255, 165, 0, 0.05)'
   },
   cameraBoxSuccess: {
     borderColor: '#27ae60',

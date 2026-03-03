@@ -27,3 +27,5 @@ serviceAccountKey.json
 App/package-lock.json
 App/package-lock.json
 *.json
+recognition-server/venv
+

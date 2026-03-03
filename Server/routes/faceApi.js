@@ -1,10 +1,10 @@
 const express = require("express");
 const multer = require("multer");
-const faceapi = require("face-api.js");
-const canvas = require("canvas");
 const path = require("path");
 const fs = require("fs");
 const admin = require("firebase-admin");
+const axios = require("axios");
+const FormData = require("form-data");
 
 // --- 1. SETUP FIREBASE ADMIN ---
 try {
@@ -42,54 +42,16 @@ try {
 }
 
 const db = admin.firestore();
-
-// --- 2. SETUP FACE API ENV ---
-const { Canvas, Image, ImageData } = canvas;
-faceapi.env.monkeyPatch({ Canvas, Image, ImageData });
-
 const router = express.Router();
 const storage = multer.memoryStorage();
 const upload = multer({ storage: storage });
 
-// --- 3. CREATE NETWORKS MANUALLY ---
-// Create the neural networks
-const ssdNet = new faceapi.SsdMobilenetv1();
-const landmarkNet = new faceapi.FaceLandmark68Net();
-const recognitionNet = new faceapi.FaceRecognitionNet();
+const FASTAPI_URL = process.env.FASTAPI_URL || "http://localhost:8000";
 
-let modelsLoaded = false;
-
-// --- 4. LOAD MODELS ---
-async function loadModels() {
-  const modelPath = path.join(__dirname, "../models");
-  console.log("📂 Loading models from:", modelPath);
-
+// --- 5. REGISTER STUDENT ROUTE (Proxy to FastAPI) ---
+router.post("/enroll-student", upload.array("faceImages", 3), async (req, res) => {
   try {
-    // Load weights directly into memory
-    await ssdNet.loadFromDisk(modelPath);
-    await landmarkNet.loadFromDisk(modelPath);
-    await recognitionNet.loadFromDisk(modelPath);
-
-    // Verify loading
-    if (!landmarkNet.params) {
-      throw new Error("LandmarkNet failed to load weights.");
-    }
-
-    modelsLoaded = true;
-    console.log("✅ SYSTEM READY: AI Models loaded.");
-
-  } catch (error) {
-    console.error("❌ Model Loading Failed:", error);
-  }
-}
-loadModels();
-
-// --- 5. REGISTER STUDENT ROUTE ---
-router.post("/enroll-student", upload.single("faceImage"), async (req, res) => {
-  if (!modelsLoaded) return res.status(503).json({ message: "Server initializing..." });
-
-  try {
-    // 1. Get Data (Note: We now accept indexNumber instead of studentId)
+    // 1. Get Data
     const { studentName, indexNumber, guardianName, contactNumber, homeAddress, grade, section } = req.body;
 
     // 2. Validate Required Text Fields
@@ -98,46 +60,57 @@ router.post("/enroll-student", upload.single("faceImage"), async (req, res) => {
       return res.status(400).json({ message: "Student Name and Index Number are required." });
     }
 
-    let descriptorArray = [];
-    let hasFace = false;
+    // 3. Process ALL uploaded images into face descriptors via FastAPI
+    const faceDescriptors = [];
+    const files = req.files || [];
 
-    // 3. Process Image ONLY if it exists
-    if (req.file) {
-      console.log("📸 Processing photo...");
-      const img = await canvas.loadImage(req.file.buffer);
-      const detections = await ssdNet.locateFaces(img);
+    for (let i = 0; i < files.length; i++) {
+      console.log(`📸 Processing photo ${i + 1}/${files.length} via FastAPI...`);
 
-      if (detections && detections.length > 0) {
-        const face = detections[0];
-        const landmarks = await landmarkNet.detectLandmarks(img, face);
-        const descriptor = await recognitionNet.computeFaceDescriptor(img, landmarks);
-        descriptorArray = Array.from(descriptor);
-        hasFace = true;
-      } else {
-        console.log("⚠️ Photo uploaded, but NO FACE detected.");
-        // We do NOT return error 400 here anymore. We just save without face data.
+      const formData = new FormData();
+      formData.append("image", files[i].buffer, {
+        filename: files[i].originalname || "image.jpg",
+        contentType: files[i].mimetype || "image/jpeg",
+      });
+
+      try {
+        const response = await axios.post(`${FASTAPI_URL}/api/encode`, formData, {
+          headers: { ...formData.getHeaders() }
+        });
+
+        const data = response.data;
+        if (data.descriptor && data.descriptor.length > 0) {
+          faceDescriptors.push(data.descriptor);
+        } else {
+          console.log(`⚠️ Photo ${i + 1}: No face detected by FastAPI, skipping.`);
+        }
+      } catch (err) {
+        console.error(`FastAPI encoding error for image ${i + 1}:`, err.message);
       }
     }
 
+    const hasFace = faceDescriptors.length > 0;
+
     // 4. Save to Firestore
     console.log("Saving to Firestore with data:", {
-      studentName, indexNumber, grade, section, guardianName, hasFace, descriptorLength: descriptorArray.length
+      studentName, indexNumber, grade, section, guardianName, hasFace, descriptorCount: faceDescriptors.length
     });
 
     await db.collection("students").doc(indexNumber).set({
       studentName: studentName,
-      studentId: indexNumber, // Fixed: Using indexNumber as studentId
+      studentId: indexNumber,
       grade: grade || "",
       section: section || "",
       guardianName: guardianName,
       guardianPhone: contactNumber,
       homeAddress: homeAddress,
-      faceDescriptor: descriptorArray,
+      faceDescriptors: faceDescriptors.map(d => ({ values: d })), // Wrap in objects
+      faceDescriptor: faceDescriptors.length > 0 ? faceDescriptors[0] : [], // Legacy compat
       createdAt: admin.firestore.FieldValue.serverTimestamp()
     });
 
-    console.log(`✅ Registered: ${studentName}`);
-    res.json({ success: true, message: "Student Registered Successfully" });
+    console.log(`✅ Registered: ${studentName} with ${faceDescriptors.length} face descriptor(s)`);
+    res.json({ success: true, message: `Student Registered with ${faceDescriptors.length} face(s)` });
 
   } catch (error) {
     console.error("Enrollment Error:", error);
@@ -145,67 +118,68 @@ router.post("/enroll-student", upload.single("faceImage"), async (req, res) => {
   }
 });
 
-// --- 6. MARK ATTENDANCE ROUTE ---
-// Server/routes/faceApi.js
-
-// --- 6. MARK ATTENDANCE ROUTE (FIXED) ---
+// --- 6. MARK ATTENDANCE ROUTE (Proxy to FastAPI) ---
 router.post("/mark-attendance", upload.single("faceImage"), async (req, res) => {
-  if (!modelsLoaded) return res.status(503).json({ message: "Server initializing..." });
-
   try {
     if (!req.file) return res.status(400).json({ message: "No face image uploaded" });
 
     // 1. Load All Students from DB
     const studentsSnapshot = await db.collection("students").get();
 
-    // 2. Prepare Face Matcher Data (CRITICAL FIX HERE)
-    const labeledDescriptors = studentsSnapshot.docs
-      .map(doc => {
-        const data = doc.data();
+    // 2. Prepare known faces data
+    const knownFaces = [];
+    studentsSnapshot.forEach(doc => {
+      const data = doc.data();
+      let descriptors = [];
 
-        // --- THE FIX: Skip students with no face or wrong data length ---
-        // A valid face descriptor ALWAYS has 128 numbers.
-        if (!data.faceDescriptor || data.faceDescriptor.length !== 128) {
-          return null;
+      if (data.faceDescriptors && Array.isArray(data.faceDescriptors)) {
+        for (const desc of data.faceDescriptors) {
+          const arr = desc.values || desc;
+          if (Array.isArray(arr) && arr.length === 128) {
+            descriptors.push(arr);
+          }
         }
+      }
 
-        return new faceapi.LabeledFaceDescriptors(
-          data.studentName,
-          [new Float32Array(data.faceDescriptor)]
-        );
-      })
-      .filter(item => item !== null); // Remove the skipped students
+      if (descriptors.length === 0 && data.faceDescriptor && data.faceDescriptor.length === 128) {
+        descriptors.push(data.faceDescriptor);
+      }
 
-    // If no one in the database has a face, we can't match anything
-    if (labeledDescriptors.length === 0) {
+      if (descriptors.length > 0) {
+        knownFaces.push({
+          label: data.studentName,
+          descriptors: descriptors
+        });
+      }
+    });
+
+    if (knownFaces.length === 0) {
       return res.status(404).json({ message: "No registered faces found in database." });
     }
 
-    const faceMatcher = new faceapi.FaceMatcher(labeledDescriptors, 0.6);
+    // 3. Send image and known faces to FastAPI
+    const formData = new FormData();
+    formData.append("image", req.file.buffer, {
+      filename: req.file.originalname || "image.jpg",
+      contentType: req.file.mimetype || "image/jpeg",
+    });
+    formData.append("known_faces_json", JSON.stringify(knownFaces));
 
-    // 3. Process the Uploaded Image
-    const img = await canvas.loadImage(req.file.buffer);
+    const response = await axios.post(`${FASTAPI_URL}/api/match`, formData, {
+      headers: { ...formData.getHeaders() }
+    });
 
-    // 1. Detect Face
-    const detections = await ssdNet.locateFaces(img);
+    const data = response.data;
+    const match = data.match;
 
-    if (!detections || detections.length === 0) {
-      return res.status(400).json({ message: "No face detected." });
-    }
-
-    const face = detections[0];
-    const landmarks = await landmarkNet.detectLandmarks(img, face);
-    const descriptor = await recognitionNet.computeFaceDescriptor(img, landmarks);
-
-    // 4. Find Best Match
-    const bestMatch = faceMatcher.findBestMatch(descriptor);
-
-    if (bestMatch.label === "unknown") {
+    if (!match || match.label === "unknown") {
       return res.status(404).json({ message: "Face not recognized." });
     }
 
-    // 5. Log Attendance
-    const studentName = bestMatch.label; // Use full name for proper record-keeping
+    console.log(`🔍 Best match: ${match.label} (distance: ${match.distance.toFixed(4)})`);
+
+    // 4. Log Attendance
+    const studentName = match.label;
 
     await db.collection("attendance").add({
       studentName: studentName,
@@ -214,12 +188,12 @@ router.post("/mark-attendance", upload.single("faceImage"), async (req, res) => 
       status: "Present"
     });
 
-    console.log(`📍 Attendance Marked: ${studentName}`);
+    console.log(`📍 Attendance Marked: ${studentName} (confidence distance: ${match.distance.toFixed(4)})`);
     res.json({ success: true, message: "Attendance Marked", student: studentName });
 
   } catch (error) {
-    console.error("Attendance Error:", error);
-    res.status(500).json({ message: "Server Error: " + error.message });
+    console.error("Attendance Error:", error.response?.data || error.message);
+    res.status(500).json({ message: "Server Error: " + (error.response?.data?.detail || error.message) });
   }
 });
 
@@ -245,7 +219,6 @@ router.get("/students", async (req, res) => {
 });
 
 // --- 7. MANAGE STUDENTS ROUTES ---
-
 
 // PUT Update Student
 router.put("/students/:id", async (req, res) => {

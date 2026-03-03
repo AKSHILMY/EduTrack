@@ -94,11 +94,18 @@ export default function AttendanceScreen({ navigation }) {
       const fileType = (uriParts[uriParts.length - 1] || "jpg").split(/\#|\?/)[0];
       const filename = `photo.${fileType}`;
 
-      formData.append("faceImage", {
-        uri: Platform.OS === "android" ? uri : uri.replace("file://", ""),
-        name: filename,
-        type: `image/${fileType}`,
-      });
+      if (Platform.OS === "web") {
+        // On web, we need to convert the URI to a Blob
+        const response = await fetch(uri);
+        const blob = await response.blob();
+        formData.append("faceImage", blob, filename);
+      } else {
+        formData.append("faceImage", {
+          uri: Platform.OS === "android" ? uri : uri.replace("file://", ""),
+          name: filename,
+          type: `image/${fileType}`,
+        });
+      }
 
       const res = await axios.post(
         `${BACKEND_API_URL}/mark-attendance`,
